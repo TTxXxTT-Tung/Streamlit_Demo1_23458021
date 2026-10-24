@@ -1,241 +1,145 @@
-from pathlib import Path
-
-import colour
 import matplotlib.pyplot as plt
 import numpy as np
-import scipy.io
+import pandas as pd
 import streamlit as st
 
-st.set_page_config(layout="wide")
-st.title("Đặc tính hoá của máy in nửa tông")
+from utils.halftone import load_halftone, get_trc, evaluate_pair, evaluate_all
+from utils.color_math import xyz100_to_srgb_preview
+from utils.spectral import spectrum_array_to_xyz
+from utils.ui import DATA_DIR, project_header, theory_box, footer_note
 
-# Luôn đọc dữ liệu cùng project, KHÔNG phụ thuộc thư mục mở CMD.
-DATA_FILE = Path(__file__).resolve().parent.parent / "halftone.mat"
+st.set_page_config(page_title="6 - Halftone", page_icon="6️⃣", layout="wide")
+project_header("6. Đặc tính hóa máy in nửa tông", "Mô hình Magenta–Yellow từ dữ liệu halftone.mat")
 
+theory_box([
+    "Dữ liệu gồm phổ nền giấy W, 120 phổ trộn Magenta–Yellow và nồng độ/diện tích mục tiêu tương ứng.",
+    "TRC dùng để ánh xạ diện tích tram mục tiêu sang diện tích hiệu dụng. Project mẫu khớp TRC bằng đa thức bậc 3.",
+    r"Demichel hai mực: $A_M=a_M(1-a_Y)$, $A_Y=a_Y(1-a_M)$, $A_O=a_Ma_Y$, $A_W=(1-a_M)(1-a_Y)$.",
+    r"Phổ dự báo dùng dạng Yule–Nielsen/Neugebauer: $R=[\sum A_i R_i^{1/n}]^n$. Trong project mẫu, $n=20$ là tham số của bộ dữ liệu, không phải hằng số phổ quát.",
+])
 
-def load_halftone_data(mat_path):
-    """Đọc phổ Y/M: 1 mẫu giấy trắng + 120 mẫu in, mỗi mẫu 31 bước sóng."""
-    if not mat_path.is_file():
-        raise FileNotFoundError(f"Không tìm thấy file phổ: {mat_path}")
+path = DATA_DIR / "halftone.mat"
+data = load_halftone(path)
+mode = st.sidebar.radio("Nội dung", [
+    "Ma trận màu M–Y",
+    "Phổ Yellow và Magenta",
+    "Đường cong tái tạo tông (TRC)",
+    "Dự báo trộn M–Y",
+    "Đánh giá toàn bộ mô hình",
+])
 
-    data = scipy.io.loadmat(str(mat_path))
-    if "W" not in data or "P" not in data:
-        raise ValueError("File halftone.mat phải chứa hai biến W và P.")
+if mode == "Ma trận màu M–Y":
+    size = 36
+    image = np.zeros((size * 11, size * 11, 3), dtype=np.uint8)
+    levels = [round(i / 10, 1) for i in range(11)]
+    for i_m, m in enumerate(levels):
+        for i_y, y in enumerate(levels):
+            spec = data.spectra[(m, y)]
+            xyz = spectrum_array_to_xyz(spec, "D65")
+            rgb, _ = xyz100_to_srgb_preview(xyz)
+            rgb255 = np.round(rgb * 255).astype(np.uint8)
+            image[i_m*size:(i_m+1)*size, i_y*size:(i_y+1)*size] = rgb255
+    image = image[::-1]
+    fig, ax = plt.subplots(figsize=(8, 8))
+    ax.imshow(image)
+    ticks = list(range(size//2, size*11, size))
+    ax.set_xticks(ticks, [f"{v:.1f}" for v in levels])
+    ax.set_yticks(ticks, [f"{v:.1f}" for v in levels[::-1]])
+    ax.set_xlabel("Yellow target area")
+    ax.set_ylabel("Magenta target area")
+    ax.set_title("Mô phỏng màu hiển thị của lưới Magenta–Yellow")
+    st.pyplot(fig, clear_figure=True)
+    st.caption("Màu trên màn hình là mô phỏng sRGB của phổ đo; không phải bản thân phổ phản xạ.")
 
-    W = np.asarray(data["W"], dtype=np.float64)
-    P_measured = np.asarray(data["P"], dtype=np.float64)
-
-    if W.shape != (1, 31) or P_measured.shape != (120, 31):
-        raise ValueError(
-            "Kích thước dữ liệu phổ không đúng: "
-            f"W = {W.shape} (cần 1 × 31), "
-            f"P = {P_measured.shape} (cần 120 × 31). "
-            "Hãy kiểm tra file halftone.mat của project."
-        )
-
-    P = np.vstack((W, P_measured))
-    if not np.all(np.isfinite(P)):
-        raise ValueError("Dữ liệu phổ có giá trị trống (NaN) hoặc vô hạn.")
-    if np.any((P < 0) | (P > 1)):
-        raise ValueError("Phổ phản xạ phải nằm trong khoảng 0 đến 1.")
-
-    # Quy ước tập dữ liệu gốc: 11 mức Yellow thay đổi nhanh nhất,
-    # 11 mức Magenta thay đổi chậm nhất; mẫu giấy trắng đặt ở hàng 0.
-    if "concs" in data:
-        concentrations = np.asarray(data["concs"], dtype=np.float64)
-        if concentrations.shape != (120, 2):
-            raise ValueError(
-                f"Biến concs có kích thước {concentrations.shape}, "
-                "cần (120, 2)."
-            )
-        expected = np.array(
-            [(m / 10, y / 10) for m in range(11) for y in range(11)
-             if not (m == 0 and y == 0)], dtype=np.float64
-        )
-        if not np.allclose(concentrations, expected, rtol=0, atol=1e-7):
-            raise ValueError(
-                "Thứ tự nồng độ trong concs khác cấu trúc 11 × 11 "
-                "mà chương trình sử dụng; cần kiểm tra file dữ liệu."
-            )
-
-    yellow = P[:11, :]
-    magenta = P[::11, :]
-    return P, yellow, magenta
-
-
-def ConvertToTristimulusValues(reflection, cmfs, illuminant):
-    """Chuyển phổ phản xạ 400–700 nm thành RGB để hiển thị (0–255)."""
-    wavelengths = np.arange(400, 701, 10)
-    sd = colour.SpectralDistribution(dict(zip(wavelengths, reflection)))
-    XYZ = colour.sd_to_XYZ(sd, cmfs, illuminant)
-    RGB = colour.XYZ_to_sRGB(XYZ / 100) * 255
-    # Không ép uint8 trực tiếp vì giá trị ngoài gamut có thể bị tràn số.
-    return np.rint(np.clip(RGB, 0, 255)).astype(np.uint8)
-
-
-def gettrc(dig, R, W, Solid, n):
-    """Đường cong tái tạo tông theo công thức Yule–Nielsen gốc (11.5)."""
-    if n <= 0:
-        raise ValueError("Hệ số n phải lớn hơn 0.")
-    R_n = np.asarray(R, dtype=np.float64) ** (1 / n)
-    W_n = np.asarray(W, dtype=np.float64) ** (1 / n)
-    Solid_n = np.asarray(Solid, dtype=np.float64) ** (1 / n)
-    delta = Solid_n - W_n
-    denominator = np.sum(delta * delta)
-    if np.isclose(denominator, 0):
-        raise ValueError("Phổ màu 100% và phổ giấy trắng trùng nhau; không thể tính TRC.")
-    c = np.array([
-        1 - np.sum((Solid_n - row) * delta) / denominator
-        for row in R_n
-    ])
-    p = np.polyfit(dig, c, 3)
-    return c, p
-
-
-try:
-    P, yellow, magenta = load_halftone_data(DATA_FILE)
-except (FileNotFoundError, ValueError, OSError) as exc:
-    st.error(f"Không thể nạp dữ liệu đặc tính hoá: {exc}")
-    st.info("Hãy đặt file halftone.mat hợp lệ cùng cấp với 'Khoa học Màu sắc.py'.")
-    st.stop()
-
-chon_item = st.sidebar.radio(
-    "Chọn các mục sau",
-    (
-        "Ảnh trộn màu vàng và tím",
-        "Phổ màu vàng và tím trên nền trắng",
-        "Đường cong tái tạo tông màu vàng và tím",
-        "Trộn hai màu vàng và tím",
-    ),
-)
-
-if chon_item == "Ảnh trộn màu vàng và tím":
-    cmfs = colour.MSDS_CMFS["CIE 1931 2 Degree Standard Observer"]
-    illuminant = colour.SDS_ILLUMINANTS["D65"]
-    SIZE = 40
-    image = np.zeros((SIZE * 11, SIZE * 11, 3), dtype=np.uint8)
-    k = 0
-    for x in range(11):
-        for y in range(11):
-            reflection = P[k, :]
-            RGB = ConvertToTristimulusValues(reflection, cmfs, illuminant)
-            image[x * SIZE:(x + 1) * SIZE, y * SIZE:(y + 1) * SIZE, :] = RGB
-            k += 1
-
-    image = image[::-1, :, :]
-    _, col, _ = st.columns([1, 3, 1])
-    with col:
-        fig, ax = plt.subplots()
-        ax.imshow(image)
-        ticks = list(range(20, 440, 40))
-        levels = [round(i / 10, 1) for i in range(11)]
-        ax.set_xticks(ticks, levels)
-        ax.set_yticks(ticks, list(reversed(levels)))
-        ax.set_xlabel("Yellow")
-        ax.set_ylabel("Magenta")
-        ax.set_title("Mix Yellow and Magenta Colors")
-        st.pyplot(fig, clear_figure=True)
-        plt.close(fig)
-
-elif chon_item == "Phổ màu vàng và tím trên nền trắng":
-    wavelengths = np.arange(400, 701, 10)
-    col1, col2 = st.columns(2)
-    for col, spectra, color, label in (
-        (col1, yellow, "#FF8000", "vàng"),
-        (col2, magenta, "#FF00FF", "tím"),
-    ):
+elif mode == "Phổ Yellow và Magenta":
+    wave = np.arange(400, 701, 10)
+    c1, c2 = st.columns(2)
+    for col, ramp, title in [(c1, data.yellow_ramp, "Yellow"), (c2, data.magenta_ramp, "Magenta")]:
         with col:
-            fig, ax = plt.subplots(figsize=(5, 5))
-            for row in spectra:
-                ax.plot(wavelengths, row, color=color)
-            ax.set_yticks(np.arange(0, 1.01, 0.1))
+            fig, ax = plt.subplots()
+            for i in range(11):
+                ax.plot(wave, ramp[i], label=f"a={i/10:.1f}")
             ax.set_xlim(400, 700)
             ax.set_ylim(0, 1)
             ax.set_xlabel("Bước sóng (nm)")
-            ax.set_ylabel("Phổ phản xạ")
-            ax.set_title(f"Phổ màu {label} trên nền trắng với a = 0:0.1:1")
+            ax.set_ylabel("Phản xạ R(λ)")
+            ax.set_title(f"Phổ {title} theo mức tram")
+            ax.grid(True, alpha=0.2)
             st.pyplot(fig, clear_figure=True)
-            plt.close(fig)
 
-elif chon_item == "Đường cong tái tạo tông màu vàng và tím":
-    n = 20
-    a_target = np.linspace(0, 1, 11)
-    col1, col2 = st.columns(2)
-    for col, spectra, color, label in (
-        (col1, yellow, "#FF8000", "vàng"),
-        (col2, magenta, "#FF00FF", "tím"),
-    ):
+elif mode == "Đường cong tái tạo tông (TRC)":
+    n = st.sidebar.number_input("Hệ số Yule–Nielsen n", min_value=0.5, max_value=50.0, value=20.0, step=0.5)
+    target = np.linspace(0, 1, 11)
+    c1, c2 = st.columns(2)
+    for col, ramp, title in [(c1, data.yellow_ramp, "Yellow"), (c2, data.magenta_ramp, "Magenta")]:
+        actual, coeff = get_trc(target, ramp, data.white, ramp[-1], float(n))
+        x = np.linspace(0, 1, 101)
+        y = np.clip(np.polyval(coeff, x), 0, 1)
         with col:
-            a_actual, p = gettrc(
-                a_target, spectra, spectra[0, :], spectra[10, :], n
-            )
-            x_ve = np.linspace(0, 1, 101)
-            y_ve = np.polyval(p, x_ve)
-            fig, ax = plt.subplots(figsize=(5, 5))
-            ax.plot(a_target, a_actual, "o", color=color, label="Số liệu tính")
-            ax.plot(x_ve, y_ve, color="black", label="Đa thức bậc 3")
-            ax.set_xlabel("Giá trị mục tiêu của a")
-            ax.set_ylabel("Giá trị thực tế của a")
-            ax.set_title(f"Đường cong tái tạo tông màu {label}")
+            fig, ax = plt.subplots()
+            ax.plot(target, actual, "o", label="Điểm suy ra từ phổ")
+            ax.plot(x, y, "-", label="Đa thức bậc 3")
+            ax.plot([0, 1], [0, 1], "--", label="Lý tưởng")
+            ax.set_xlabel("Diện tích mục tiêu")
+            ax.set_ylabel("Diện tích hiệu dụng")
+            ax.set_title(f"TRC {title}")
+            ax.grid(True, alpha=0.2)
             ax.legend()
             st.pyplot(fig, clear_figure=True)
-            plt.close(fig)
+            df = pd.DataFrame({"target": target, "actual": actual, "TVI": actual-target})
+            st.dataframe(df.round(4), use_container_width=True)
 
-elif chon_item == "Trộn hai màu vàng và tím":
-    _, col, _ = st.columns([1, 3, 1])
-    with col:
-        a_mag_target = st.number_input(
-            "Nhập mục tiêu a của màu tím [0:0.1:1]",
-            min_value=0.0, max_value=1.0, value=0.0, step=0.1, format="%.1f",
-        )
-        a_yel_target = st.number_input(
-            "Nhập mục tiêu a của màu vàng [0:0.1:1]",
-            min_value=0.0, max_value=1.0, value=0.0, step=0.1, format="%.1f",
-        )
-        if st.button("Dự báo"):
-            i_mag = round(a_mag_target * 10)
-            i_yel = round(a_yel_target * 10)
-            if (abs(a_mag_target * 10 - i_mag) > 1e-6
-                    or abs(a_yel_target * 10 - i_yel) > 1e-6):
-                st.warning("Chỉ nhập các mức 0.0, 0.1, 0.2, …, 1.0.")
-            else:
-                i = i_mag * 11 + i_yel
-                measured = P[i, :]
-                n = 20
-                a_target = np.linspace(0, 1, 11)
-                _, p_mag = gettrc(a_target, magenta, magenta[0, :], magenta[10, :], n)
-                _, p_yel = gettrc(a_target, yellow, yellow[0, :], yellow[10, :], n)
+elif mode == "Dự báo trộn M–Y":
+    levels = [round(i / 10, 1) for i in range(11)]
+    m = st.sidebar.select_slider("Magenta target", options=levels, value=0.5)
+    y = st.sidebar.select_slider("Yellow target", options=levels, value=0.5)
+    n = st.sidebar.number_input("Hệ số Yule–Nielsen n", min_value=0.5, max_value=50.0, value=20.0, step=0.5)
+    ill = st.sidebar.selectbox("Nguồn sáng để tính ΔE00", ["D65", "D50"], index=0)
+    ev = evaluate_pair(data, m, y, n=float(n), illuminant=ill)
 
-                # Đa thức bậc 3 có thể nhích ra ngoài 0..1 ở hai đầu;
-                # diện tích hạt trame thực tế luôn nằm trong 0..1.
-                a_mag_actual = float(np.clip(np.polyval(p_mag, a_mag_target), 0, 1))
-                a_yel_actual = float(np.clip(np.polyval(p_yel, a_yel_target), 0, 1))
-                Am = a_mag_actual * (1 - a_yel_actual)
-                Ay = a_yel_actual * (1 - a_mag_actual)
-                Aw = (1 - a_mag_actual) * (1 - a_yel_actual)
-                Ao = a_mag_actual * a_yel_actual
+    a, b, c, d = st.columns(4)
+    a.metric("aM hiệu dụng", f"{ev['a_m_actual']:.4f}")
+    b.metric("aY hiệu dụng", f"{ev['a_y_actual']:.4f}")
+    c.metric("RMSE phổ", f"{ev['rmse']:.5f}")
+    d.metric("ΔE00", f"{ev['delta_e00']:.3f}")
 
-                overlap = P[120, :]
-                WW = P[0, :]
-                pred = (
-                    Am * magenta[10, :] ** (1 / n)
-                    + Ay * yellow[10, :] ** (1 / n)
-                    + Ao * overlap ** (1 / n)
-                    + Aw * WW ** (1 / n)
-                ) ** n
+    wave = np.arange(400, 701, 10)
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.plot(wave, ev["measured"], "o", label="Phổ đo")
+    ax.plot(wave, ev["predicted"], "-", label="Phổ dự báo")
+    ax.set_xlim(400, 700)
+    ax.set_ylim(0, 1)
+    ax.set_xlabel("Bước sóng (nm)")
+    ax.set_ylabel("Phản xạ")
+    ax.set_title(f"M={m:.1f}, Y={y:.1f}, n={n:g}")
+    ax.grid(True, alpha=0.2)
+    ax.legend()
+    st.pyplot(fig, clear_figure=True)
 
-                wavelengths = np.arange(400, 701, 10)
-                fig, ax = plt.subplots(figsize=(5, 5))
-                ax.plot(wavelengths, measured, "ro", label="Phổ đo thực tế")
-                ax.plot(wavelengths, pred, "b", label="Phổ dự báo")
-                ax.set_ylim(0, 1)
-                ax.legend()
-                ax.set_xlabel("Bước sóng (nm)")
-                ax.set_ylabel("Phổ phản xạ")
-                ax.set_title(
-                    "Phổ phản xạ khi trộn hai màu tím và vàng\n"
-                    f"với tỷ lệ hạt trame a_mag = {a_mag_target:.1f} "
-                    f"và a_yel = {a_yel_target:.1f}"
-                )
-                st.pyplot(fig, clear_figure=True)
-                plt.close(fig)
+    areas = pd.DataFrame({"Vùng": list(ev["areas"].keys()), "Diện tích": list(ev["areas"].values())})
+    st.dataframe(areas, use_container_width=True)
+    st.caption(f"Tổng diện tích Demichel = {areas['Diện tích'].sum():.6f} (phải xấp xỉ 1).")
+
+elif mode == "Đánh giá toàn bộ mô hình":
+    n = st.sidebar.number_input("Hệ số Yule–Nielsen n", min_value=0.5, max_value=50.0, value=20.0, step=0.5)
+    ill = st.sidebar.selectbox("Nguồn sáng", ["D65", "D50"], index=0)
+    if st.button("Chạy đánh giá 120 ô", type="primary"):
+        rows = evaluate_all(data, n=float(n), illuminant=ill)
+        df = pd.DataFrame(rows, columns=["Magenta", "Yellow", "RMSE_spectral", "DeltaE00"])
+        st.session_state["halftone_eval"] = df
+    if "halftone_eval" in st.session_state:
+        df = st.session_state["halftone_eval"]
+        c1, c2, c3 = st.columns(3)
+        c1.metric("ΔE00 trung bình", f"{df['DeltaE00'].mean():.3f}")
+        c2.metric("ΔE00 lớn nhất", f"{df['DeltaE00'].max():.3f}")
+        c3.metric("RMSE phổ trung bình", f"{df['RMSE_spectral'].mean():.5f}")
+        st.dataframe(df.sort_values("DeltaE00", ascending=False), use_container_width=True, height=420)
+        fig, ax = plt.subplots()
+        sc = ax.scatter(df["Yellow"], df["Magenta"], c=df["DeltaE00"], s=80)
+        fig.colorbar(sc, ax=ax, label="ΔE00")
+        ax.set_xlabel("Yellow")
+        ax.set_ylabel("Magenta")
+        ax.set_title("Bản đồ sai lệch mô hình theo lưới M–Y")
+        st.pyplot(fig, clear_figure=True)
+
+footer_note()
